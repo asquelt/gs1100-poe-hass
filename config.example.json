@@ -1,0 +1,15 @@
+{
+  "interval": 30,
+  "base_topic": "gs1100",
+  "discovery_prefix": "homeassistant",
+  "mqtt": {
+    "host": "core-mosquitto",
+    "port": 1883,
+    "username": "gs1100",
+    "password": "CHANGE_ME"
+  },
+  "switches": [
+    { "name": "Switch PoE 1", "host": "192.168.1.3", "password": "HASLO_Z_NAKLEJKI_1" },
+    { "name": "Switch PoE 2", "host": "192.168.8.X", "password_env": "GS1100_SW2_PASSWORD" }
+  ]
+}
