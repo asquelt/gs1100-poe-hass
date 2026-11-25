@@ -384,9 +384,11 @@ def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: in
             "value_template": f"{{{{ value_json.ports[{i}].poe_enabled }}}}",
             "entity_category": "diagnostic",
         }
+        # 0.2.0 tworzyło przełącznik portu jako domyślnie wyłączoną encję pod innym id -- usuń ją
+        cmps[f"p{n:02d}_port_switch"] = {"platform": "switch"}
         for kind, key, field, label, extra in (
             ("poe", f"p{n:02d}_poe_switch", "poe_enabled", "zasilanie PoE", {}),
-            ("port", f"p{n:02d}_port_switch", "enabled", "port aktywny", {"enabled_by_default": False}),
+            ("port", f"p{n:02d}_if_switch", "enabled", "port aktywny", {}),
         ):
             if controllable(cfg, control, n, kind):
                 cmps[key] = {

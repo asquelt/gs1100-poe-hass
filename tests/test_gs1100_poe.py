@@ -173,16 +173,18 @@ class Tests(unittest.TestCase):
         st = {"mac": "00:11:22:33:44:55"}
         on = g.discovery_payload("d", cfg, st, "gs1100", control=True)["components"]
         self.assertEqual(on["p01_poe_switch"], {"platform": "switch"})
-        self.assertEqual(on["p16_port_switch"], {"platform": "switch"})
+        self.assertEqual(on["p16_if_switch"], {"platform": "switch"})
         self.assertEqual(on["p04_poe_switch"]["command_topic"], "gs1100/d/port/4/poe/set")
         self.assertEqual(on["p04_poe_switch"]["value_template"], "{{ value_json.ports[3].poe_enabled }}")
-        self.assertIs(on["p04_port_switch"]["enabled_by_default"], False)
+        self.assertEqual(on["p04_if_switch"]["command_topic"], "gs1100/d/port/4/port/set")
+        self.assertNotIn("enabled_by_default", on["p04_if_switch"])
+        self.assertEqual(on["p04_port_switch"], {"platform": "switch"})
         none = g.discovery_payload("d", cfg, st, "gs1100", control=False)["components"]
         self.assertTrue(all(none[f"p{n:02d}_{k}_switch"] == {"platform": "switch"}
-                            for n in range(1, 17) for k in ("poe", "port")))
+                            for n in range(1, 17) for k in ("poe", "if")))
         noprot = g.discovery_payload("d", {"host": "h"}, st, "gs1100", control=True)["components"]
         self.assertIn("command_topic", noprot["p01_poe_switch"])
-        self.assertEqual(noprot["p01_port_switch"], {"platform": "switch"})
+        self.assertEqual(noprot["p01_if_switch"], {"platform": "switch"})
 
     def test_bad_password(self):
         with self.assertRaises(g.AuthError):
@@ -201,7 +203,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(rc, 0)
         msgs = dict(line.split(" ", 1) for line in out.getvalue().splitlines())
         disc = json.loads(msgs["homeassistant/device/gs1100_001122334455/config"])
-        self.assertEqual(len(disc["components"]), 4 + 16 * 5)
+        self.assertEqual(len(disc["components"]), 4 + 16 * 6)
         self.assertEqual(disc["components"]["p04_poe_w"]["value_template"], "{{ value_json.ports[3].poe_w }}")
         names = {k: c.get("name") for k, c in disc["components"].items()}
         self.assertEqual(names["p04_poe_w"], "Port 4 – Kamera 1 PoE")
