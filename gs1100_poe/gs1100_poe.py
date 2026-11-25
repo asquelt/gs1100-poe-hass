@@ -7,10 +7,13 @@ Protokół odtworzony z panelu WWW (bundle index-BBJ23RVh.js / aes-util-CNB8NLUb
     (PKCS7, wynik w base64) -- to nie jest handshake, tylko zaciemnienie;
   * POST /login.cgi  password=<enc>&seed=<enc(losowy uint32)>
         -> {"status_msg":"ok","v":"<token>","f":<1 = wymuszona zmiana hasła>}
-  * token idzie w nagłówku `token:` przy każdym żądaniu;
-  * GET /sys_info.cgi   -> {"data":{total_power,left_power,max_led_power,
-                            port_status:[[link,tx,rx,loop,poe_W], ...], sys_MAC, ...}}
-  * GET /ports_info.cgi -> {"data":{portState,portPoE (maski bitowe), ...}}
+  * token idzie w nagłówku `token:` przy każdym żądaniu, do tego ciasteczko `sessionId`
+    z odpowiedzi logowania; wysyłamy też Origin/Referer jak przeglądarka;
+  * panel trzyma JEDNĄ sesję naraz: login przy cudzej aktywnej sesji = 403
+    (poller i przeglądarka wzajemnie się blokują do wylogowania / timeoutu);
+  * GET /sys_info.cgi   -> {"data":{total_power (budżet, "135"),left_power,max_led_power,
+                            port_status:[["100 Mbps"|"Down",tx,rx,loop,"7" (W)], ...], sys_MAC, ...}}
+  * GET /ports_info.cgi -> {"data":{portState,portPoE (maski bitowe jako "0xffff"), ...}}
   * 401/403/408 = sesja wygasła -> logujemy się ponownie.
 
 Poller wyłącznie czyta (2x GET na cykl). Nie woła refresh/clear ani żadnego *_set.cgi.
@@ -42,7 +45,7 @@ log = logging.getLogger("gs1100")
 AES_KEY = b"iti01234567890sw"
 AES_IV = b"sw01234567890iti"
 NO_TOKEN = "tokeniserrorrrrr"  # to samo wysyła panel, gdy nie ma sesji
-POE_BUDGET_W = 135.0
+USER_AGENT = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 PASSWORD_RE = re.compile(r"^[a-zA-Z0-9~!@#$%\^&*()_+`\-={}\[\]:;<>./\\]{9,64}$")
 
 # ---------------------------------------------------------------- AES-128-CBC
@@ -138,10 +141,20 @@ class GS1100:
         self.password = password
         self.timeout = timeout
         self.token: str | None = None
+        self.cookie: str | None = None
 
     def _request(self, path: str, form: dict | None = None) -> dict:
         data = None
-        headers = {"token": self.token or NO_TOKEN, "Accept": "application/json"}
+        # nagłówki jak z przeglądarki; sesja = token + ciasteczko
+        headers = {
+            "token": self.token or NO_TOKEN,
+            "Accept": "application/json, text/plain, */*",
+            "Origin": self.base,
+            "Referer": self.base + "/",
+            "User-Agent": USER_AGENT,
+        }
+        if self.cookie:
+            headers["Cookie"] = self.cookie
         if form is not None:
             data = urllib.parse.urlencode({k: encrypt_field(str(v)) for k, v in form.items()}).encode()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -149,10 +162,12 @@ class GS1100:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = resp.read()
+                if resp.headers.get("Set-Cookie"):
+                    self.cookie = resp.headers["Set-Cookie"].split(";", 1)[0]
         except urllib.error.HTTPError as e:
             e.close()
             if e.code in (401, 403, 408):
-                self.token = None
+                self.token = self.cookie = None
                 raise SessionExpired(f"{path}: HTTP {e.code}") from None
             raise
         return json.loads(body)
@@ -163,7 +178,7 @@ class GS1100:
     def login(self) -> None:
         if not PASSWORD_RE.match(self.password):
             raise AuthError("hasło nie spełnia formatu panelu (9-64 znaki)")
-        self.token = None
+        self.token = self.cookie = None
         try:
             r = self._request("/login.cgi", {"password": self.password, "seed": random.getrandbits(32)})
         except SessionExpired as e:
@@ -180,7 +195,7 @@ class GS1100:
                 self._request("/logout.cgi", {"logout": 1})
             except Exception as e:  # noqa: BLE001 - best effort
                 log.debug("logout: %s", e)
-            self.token = None
+            self.token = self.cookie = None
 
     def get(self, path: str) -> dict:
         """GET z jednym ponownym logowaniem, gdy sesja wygasła."""
@@ -206,11 +221,19 @@ def _num(v) -> float | None:
     return float(m.group()) if m else None
 
 
+def _mask(v) -> int | None:
+    """Maski portów przychodzą jako hex w stringu ("0xffff")."""
+    try:
+        return int(str(v), 0)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse(raw: dict, nports: int = 16) -> dict:
     """Surowe odpowiedzi -> płaski stan publikowany do MQTT."""
     sysd = raw["sys_info"].get("data", raw["sys_info"])
     portd = raw.get("ports_info", {}).get("data", raw.get("ports_info", {}))
-    poe_mask = _num(portd.get("portPoE"))
+    poe_mask = _mask(portd.get("portPoE"))
     ports = []
     for i, row in enumerate(sysd.get("port_status", [])[:nports]):
         row = list(row)
@@ -219,22 +242,22 @@ def parse(raw: dict, nports: int = 16) -> dict:
                 "link": str(row[0]) if row else None,
                 # kolumny: link, tx, rx, loop, PoE [W]
                 "poe_w": _num(row[4]) if len(row) > 4 else None,
-                "poe_enabled": None if poe_mask is None else ("ON" if int(poe_mask) >> i & 1 else "OFF"),
+                "poe_enabled": None if poe_mask is None else ("ON" if poe_mask >> i & 1 else "OFF"),
             }
         )
-    watts = [p["poe_w"] for p in ports if p["poe_w"] is not None]
-    used = round(sum(watts), 2) if watts else None
+    # total_power = budżet zasilacza (135), left_power = zapas; pobór liczy sam switch (pełne waty)
+    budget, left = _num(sysd.get("total_power")), _num(sysd.get("left_power"))
+    used = None if budget is None or left is None else budget - left
     return {
         "mac": sysd.get("sys_MAC"),
         "name": sysd.get("sys_dev_name"),
         "model": sysd.get("model_name"),
         "firmware": sysd.get("sys_fmw_ver"),
         "uptime": _num(sysd.get("system_uptime")),
-        # nazwy jak w panelu; znaczenie total_power (budżet czy pobór) do potwierdzenia na żywych danych
-        "poe_total_power": _num(sysd.get("total_power")),
-        "poe_power_left": _num(sysd.get("left_power")),
-        "poe_ports_sum": used,
-        "poe_budget_pct": None if used is None else round(100 * used / POE_BUDGET_W, 1),
+        "poe_budget": budget,
+        "poe_power_left": left,
+        "poe_used": used,
+        "poe_budget_pct": None if used is None or not budget else round(100 * used / budget, 1),
         "ports": ports,
     }
 
@@ -261,14 +284,13 @@ def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: in
         c.update(extra)
         cmps[key] = c
 
-    sensor("poe_ports_sum", "PoE pobór", "{{ value_json.poe_ports_sum }}", "W", "power", suggested_display_precision=1)
-    sensor("poe_total_power", "PoE Total Power", "{{ value_json.poe_total_power }}", "W", "power")
+    sensor("poe_used", "PoE pobór", "{{ value_json.poe_used }}", "W", "power")
     sensor("poe_power_left", "PoE zapas", "{{ value_json.poe_power_left }}", "W", "power")
-    sensor("poe_budget_pct", f"PoE budżet ({POE_BUDGET_W:.0f} W)", "{{ value_json.poe_budget_pct }}", "%")
+    sensor("poe_budget", "PoE budżet", "{{ value_json.poe_budget }}", "W", "power", entity_category="diagnostic")
+    sensor("poe_budget_pct", "PoE wykorzystanie budżetu", "{{ value_json.poe_budget_pct }}", "%")
     for i in range(nports):
         n = i + 1
-        sensor(f"p{n:02d}_poe_w", f"Port {n} PoE", f"{{{{ value_json.ports[{i}].poe_w }}}}", "W", "power",
-               suggested_display_precision=1)
+        sensor(f"p{n:02d}_poe_w", f"Port {n} PoE", f"{{{{ value_json.ports[{i}].poe_w }}}}", "W", "power")
         sensor(f"p{n:02d}_link", f"Port {n} link", f"{{{{ value_json.ports[{i}].link }}}}",
                entity_category="diagnostic")
         cmps[f"p{n:02d}_poe_enabled"] = {

@@ -30,23 +30,27 @@ class FakeSwitch(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, obj=None):
+    def _send(self, code, obj=None, cookie=None):
         body = json.dumps(obj).encode() if obj is not None else b""
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if cookie:
+            self.send_header("Set-Cookie", f"sessionId={cookie};SameSite=Strict;path=/;HttpOnly;")
         self.end_headers()
         self.wfile.write(body)
 
     def do_POST(self):
         form = urllib.parse.parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode())
         cls = type(self)
+        if self.headers.get("Origin") != f"http://{self.headers['Host']}":
+            return self._send(403)
         if self.path == "/login.cgi":
             if form["password"][0] != g.encrypt_field(PASSWORD) or "seed" not in form:
                 return self._send(200, {"status_msg": "Incorrect password, please try again!"})
             cls.logins += 1
             cls.token = f"tok{cls.logins}"
-            return self._send(200, {"status_msg": "ok", "v": cls.token, "f": 0})
+            return self._send(200, {"status_msg": "ok", "v": cls.token}, cookie=cls.token)
         if self.path == "/logout.cgi":
             cls.token = None
             return self._send(200, {"status_msg": "ok"})
@@ -58,20 +62,21 @@ class FakeSwitch(BaseHTTPRequestHandler):
             return self._send(200, {"model_name": "GS1100-16EP", "login_status": "0"})
         if cls.expire_next:
             cls.expire_next, cls.token = False, None
-        if cls.token is None or self.headers.get("token") != cls.token:
+        if cls.token is None or self.headers.get("token") != cls.token \
+                or self.headers.get("Cookie") != f"sessionId={cls.token}":
             return self._send(401)
         if self.path == "/sys_info.cgi":
             rows = [["Down", "0", "0", "Normal", "0"] for _ in range(16)]
-            rows[0] = ["1000M Full", "12345", "678", "Normal", "7.4"]
-            rows[3] = ["100M Full", "1", "2", "Normal", "12.1"]
+            rows[0] = ["1000 Mbps", "12345", "678", "Normal", "7"]
+            rows[3] = ["100 Mbps", "1", "2", "Normal", "12"]
             return self._send(200, {"status_msg": "ok", "data": {
                 "model_name": "GS1100-16EP", "sys_dev_name": "szafa-1", "sys_fmw_ver": "V1.00",
                 "sys_MAC": "00:11:22:33:44:55", "system_uptime": "4242",
-                "total_power": "19.5", "left_power": "115.5", "max_led_power": "135",
+                "total_power": "135", "left_power": "115", "max_led_power": "128",
                 "port_status": rows}})
         if self.path == "/ports_info.cgi":
             return self._send(200, {"status_msg": "ok", "data": {"model_name": "GS1100-16EP",
-                                                                  "portState": 65535, "portPoE": 0b1001}})
+                                                                  "portState": "0xffff", "portPoE": "0x9"}})
         self._send(404)
 
 
@@ -98,11 +103,12 @@ class Tests(unittest.TestCase):
     def test_poll_and_relogin(self):
         sw = g.GS1100(self.host, PASSWORD)
         st = g.parse(sw.raw())
-        self.assertEqual(st["ports"][0], {"link": "1000M Full", "poe_w": 7.4, "poe_enabled": "ON"})
+        self.assertEqual(st["ports"][0], {"link": "1000 Mbps", "poe_w": 7.0, "poe_enabled": "ON"})
         self.assertEqual(st["ports"][1]["poe_enabled"], "OFF")
-        self.assertEqual(st["poe_ports_sum"], 19.5)
-        self.assertEqual(st["poe_power_left"], 115.5)
-        self.assertEqual(st["poe_budget_pct"], 14.4)
+        self.assertEqual(st["ports"][3]["poe_enabled"], "ON")
+        self.assertEqual(st["poe_used"], 20)
+        self.assertEqual(st["poe_power_left"], 115)
+        self.assertEqual(st["poe_budget_pct"], 14.8)
         FakeSwitch.expire_next = True
         sw.raw()
         self.assertEqual(FakeSwitch.logins, 2)
@@ -129,7 +135,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(disc["components"]["p04_poe_w"]["value_template"], "{{ value_json.ports[3].poe_w }}")
         self.assertEqual(disc["device"]["connections"], [["mac", "00:11:22:33:44:55"]])
         self.assertEqual(disc["state_topic"], "gs1100/gs1100_001122334455/state")
-        self.assertEqual(json.loads(msgs["gs1100/gs1100_001122334455/state"])["ports"][3]["poe_w"], 12.1)
+        self.assertEqual(json.loads(msgs["gs1100/gs1100_001122334455/state"])["ports"][3]["poe_w"], 12)
         self.assertEqual(msgs["gs1100/gs1100_001122334455/availability"], "offline")  # po wyjściu
 
 
