@@ -9,7 +9,8 @@
     "password": "CHANGE_ME"
   },
   "switches": [
-    { "name": "Switch PoE 1", "host": "192.168.1.3", "password": "HASLO_Z_NAKLEJKI_1" },
+    { "name": "Switch PoE 1", "host": "192.168.1.3", "password": "HASLO_Z_NAKLEJKI_1",
+      "port_names": "9=Kamera 1, 11=Dzwonek" },
     { "name": "Switch PoE 2", "host": "192.168.8.X", "password_env": "GS1100_SW2_PASSWORD" }
   ]
 }

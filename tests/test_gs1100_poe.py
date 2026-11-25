@@ -123,7 +123,8 @@ class Tests(unittest.TestCase):
 
     def test_main_dry_run_publishes_discovery_and_state(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump({"switches": [{"name": "Switch PoE 1", "host": self.host, "password": PASSWORD}]}, f)
+            json.dump({"switches": [{"name": "Switch PoE 1", "host": self.host, "password": PASSWORD,
+                                     "port_names": "4=Kamera 1, 9: Dzwonek; 16 = Uplink, 3="}]}, f)
             f.flush()
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -133,6 +134,13 @@ class Tests(unittest.TestCase):
         disc = json.loads(msgs["homeassistant/device/gs1100_001122334455/config"])
         self.assertEqual(len(disc["components"]), 4 + 16 * 3)
         self.assertEqual(disc["components"]["p04_poe_w"]["value_template"], "{{ value_json.ports[3].poe_w }}")
+        names = {k: c["name"] for k, c in disc["components"].items()}
+        self.assertEqual(names["p04_poe_w"], "Port 4 – Kamera 1 PoE")
+        self.assertEqual(names["p09_link"], "Port 9 – Dzwonek link")
+        self.assertEqual(names["p16_poe_enabled"], "Port 16 – Uplink PoE włączone")
+        self.assertEqual(names["p03_poe_w"], "Port 3 PoE")
+        self.assertEqual(g.port_names({"2": "A"}), {2: "A"})
+        self.assertEqual(g.port_names(["A", "", "C"]), {1: "A", 3: "C"})
         self.assertEqual(disc["device"]["connections"], [["mac", "00:11:22:33:44:55"]])
         self.assertEqual(disc["state_topic"], "gs1100/gs1100_001122334455/state")
         self.assertEqual(json.loads(msgs["gs1100/gs1100_001122334455/state"])["ports"][3]["poe_w"], 12)

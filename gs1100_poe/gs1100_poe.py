@@ -272,8 +272,27 @@ def device_id(cfg: dict, state: dict) -> str:
     return f"gs1100_{mac or re.sub(r'[^0-9a-z]', '_', cfg['host'].lower())}"
 
 
+def port_names(spec) -> dict[int, str]:
+    """Opisy portów: "9=Kamera 1, 11=Dzwonek" (opcja add-onu) albo {"9": "Kamera 1"} / lista od portu 1."""
+    if not spec:
+        return {}
+    if isinstance(spec, dict):
+        pairs = spec.items()
+    elif isinstance(spec, list):
+        pairs = enumerate(spec, 1)
+    else:
+        pairs = re.findall(r"(\d+)\s*[=:]\s*([^,;\n]+)", str(spec))
+    out = {}
+    for port, name in pairs:
+        name = str(name or "").strip()
+        if name:
+            out[int(port)] = name
+    return out
+
+
 def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: int = 16) -> dict:
     cmps: dict = {}
+    names = port_names(cfg.get("port_names"))
 
     def sensor(key, name, tpl, unit=None, dev_cla=None, **extra):
         c = {"platform": "sensor", "name": name, "unique_id": f"{dev_id}_{key}", "value_template": tpl}
@@ -290,12 +309,13 @@ def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: in
     sensor("poe_budget_pct", "PoE wykorzystanie budżetu", "{{ value_json.poe_budget_pct }}", "%")
     for i in range(nports):
         n = i + 1
-        sensor(f"p{n:02d}_poe_w", f"Port {n} PoE", f"{{{{ value_json.ports[{i}].poe_w }}}}", "W", "power")
-        sensor(f"p{n:02d}_link", f"Port {n} link", f"{{{{ value_json.ports[{i}].link }}}}",
+        port = f"Port {n} – {names[n]}" if n in names else f"Port {n}"
+        sensor(f"p{n:02d}_poe_w", f"{port} PoE", f"{{{{ value_json.ports[{i}].poe_w }}}}", "W", "power")
+        sensor(f"p{n:02d}_link", f"{port} link", f"{{{{ value_json.ports[{i}].link }}}}",
                entity_category="diagnostic")
         cmps[f"p{n:02d}_poe_enabled"] = {
             "platform": "binary_sensor",
-            "name": f"Port {n} PoE włączone",
+            "name": f"{port} PoE włączone",
             "unique_id": f"{dev_id}_p{n:02d}_poe_enabled",
             "value_template": f"{{{{ value_json.ports[{i}].poe_enabled }}}}",
             "entity_category": "diagnostic",
@@ -387,7 +407,7 @@ class Worker:
                 retain=True,
             )
             self.discovered = True
-        self.pub.pub(f"{self.pub.base}/{self.dev_id}/state", state)
+        self.pub.pub(f"{self.pub.base}/{self.dev_id}/state", state, retain=True)
         self.pub.pub(f"{self.pub.base}/{self.dev_id}/availability", "online", retain=True)
         return True
 
