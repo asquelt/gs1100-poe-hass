@@ -1,5 +1,5 @@
 name: GS1100 PoE
-version: "0.2.0"
+version: "0.2.1"
 slug: gs1100_poe
 description: PoE per port ze switchy Zyxel GS1100-16EP do MQTT (discovery)
 arch:
@@ -12,13 +12,14 @@ services:
   - mqtt:need
 options:
   interval: 30
+  control: false
   switches:
     - name: Switch PoE 1
       host: 192.168.8.122
       password: ""
 schema:
   interval: int(5,3600)
-  control: bool?
+  control: bool
   base_topic: str?
   switches:
     - name: str
