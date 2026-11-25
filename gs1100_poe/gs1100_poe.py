@@ -374,7 +374,11 @@ def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: in
     for i in range(nports):
         n = i + 1
         port = f"Port {n} – {names[n]}" if n in names else f"Port {n}"
-        sensor(f"p{n:02d}_poe_w", f"{port} PoE", f"{{{{ value_json.ports[{i}].poe_w }}}}", "W", "power")
+        # atrybuty (nazwa, ochrona) pozwalają dashboardowi nadążać za zmianami konfiguracji
+        sensor(f"p{n:02d}_poe_w", f"{port} PoE", f"{{{{ value_json.ports[{i}].poe_w }}}}", "W", "power",
+               json_attributes_topic=f"{base}/{dev_id}/state",
+               json_attributes_template=(f"{{{{ {{'port': {n}, 'label': value_json.ports[{i}].label, "
+                                         f"'protected': value_json.ports[{i}].protected}} | tojson }}}}"))
         sensor(f"p{n:02d}_link", f"{port} link", f"{{{{ value_json.ports[{i}].link }}}}",
                entity_category="diagnostic")
         cmps[f"p{n:02d}_poe_enabled"] = {
@@ -395,6 +399,7 @@ def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: in
                     "platform": "switch",
                     "name": f"{port} {label}",
                     "unique_id": f"{dev_id}_{key}",
+                    "default_entity_id": f"switch.{dev_id}_p{n:02d}_{kind}",
                     "command_topic": f"{base}/{dev_id}/port/{n}/{kind}/set",
                     "value_template": f"{{{{ value_json.ports[{i}].{field} }}}}",
                     "state_on": "ON",
@@ -497,6 +502,10 @@ class Worker:
         except Exception as e:  # noqa: BLE001 - sieć / JSON / timeout
             log.warning("%s: odczyt nieudany: %s", self.cfg["host"], e)
             return self._offline()
+        names, protected = port_names(self.cfg.get("port_names")), port_set(self.cfg.get("protected_ports"))
+        for n, port in enumerate(state["ports"], 1):
+            port["label"] = names.get(n, "")
+            port["protected"] = n in protected or not self.control
         self.dev_id = self.dev_id or device_id(self.cfg, state)
         if not self.discovered:
             self.pub.pub(

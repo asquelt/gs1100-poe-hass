@@ -175,6 +175,8 @@ class Tests(unittest.TestCase):
         self.assertEqual(on["p01_poe_switch"], {"platform": "switch"})
         self.assertEqual(on["p16_if_switch"], {"platform": "switch"})
         self.assertEqual(on["p04_poe_switch"]["command_topic"], "gs1100/d/port/4/poe/set")
+        self.assertEqual(on["p04_poe_switch"]["default_entity_id"], "switch.d_p04_poe")
+        self.assertEqual(on["p04_if_switch"]["default_entity_id"], "switch.d_p04_port")
         self.assertEqual(on["p04_poe_switch"]["value_template"], "{{ value_json.ports[3].poe_enabled }}")
         self.assertEqual(on["p04_if_switch"]["command_topic"], "gs1100/d/port/4/port/set")
         self.assertNotIn("enabled_by_default", on["p04_if_switch"])
@@ -207,6 +209,10 @@ class Tests(unittest.TestCase):
         self.assertEqual(disc["components"]["p04_poe_w"]["value_template"], "{{ value_json.ports[3].poe_w }}")
         names = {k: c.get("name") for k, c in disc["components"].items()}
         self.assertEqual(names["p04_poe_w"], "Port 4 – Kamera 1 PoE")
+        self.assertEqual(disc["components"]["p04_poe_w"]["json_attributes_template"],
+                         "{{ {'port': 4, 'label': value_json.ports[3].label, 'protected': value_json.ports[3].protected} | tojson }}")
+        port4 = json.loads(msgs["gs1100/gs1100_001122334455/state"])["ports"][3]
+        self.assertEqual((port4["label"], port4["protected"]), ("Kamera 1", True))  # control wyłączone
         self.assertEqual(names["p09_link"], "Port 9 – Dzwonek link")
         self.assertEqual(names["p16_poe_enabled"], "Port 16 – Uplink PoE włączone")
         self.assertEqual(names["p03_poe_w"], "Port 3 PoE")

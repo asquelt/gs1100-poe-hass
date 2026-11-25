@@ -1,5 +1,5 @@
 name: GS1100 PoE
-version: "0.2.3"
+version: "0.3.0"
 slug: gs1100_poe
 description: PoE per port ze switchy Zyxel GS1100-16EP do MQTT (discovery)
 arch:
