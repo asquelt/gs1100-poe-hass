@@ -23,7 +23,7 @@ Endpoints are undocumented and may change with firmware updates.
 Set `control: true` to get switches in Home Assistant:
 
 - **"Port N zasilanie PoE"** — PoE power on/off per port (e.g. to power-cycle a camera).
-- **"Port N port aktywny"** — the port itself on/off. Created only when `protected_ports`
+- **"Port N port włączony"** — the port itself on/off. Created only when `protected_ports`
   is set.
 
 `protected_ports` (per switch, e.g. `15, 16`) lists ports that must never be switched:

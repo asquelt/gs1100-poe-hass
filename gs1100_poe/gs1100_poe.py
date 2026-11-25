@@ -388,7 +388,7 @@ def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: in
         cmps[f"p{n:02d}_port_switch"] = {"platform": "switch"}
         for kind, key, field, label, extra in (
             ("poe", f"p{n:02d}_poe_switch", "poe_enabled", "zasilanie PoE", {}),
-            ("port", f"p{n:02d}_if_switch", "enabled", "port aktywny", {}),
+            ("port", f"p{n:02d}_if_switch", "enabled", "port włączony", {}),
         ):
             if controllable(cfg, control, n, kind):
                 cmps[key] = {
