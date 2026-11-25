@@ -16,7 +16,10 @@ Protokół odtworzony z panelu WWW (bundle index-BBJ23RVh.js / aes-util-CNB8NLUb
   * GET /ports_info.cgi -> {"data":{portState,portPoE (maski bitowe jako "0xffff"), ...}}
   * 401/403/408 = sesja wygasła -> logujemy się ponownie.
 
-Poller wyłącznie czyta (2x GET na cykl). Nie woła refresh/clear ani żadnego *_set.cgi.
+Domyślnie poller wyłącznie czyta (2x GET na cykl). Z opcją `control: true` wystawia
+przełączniki PoE / portu i wtedy woła POST /port_state_set.cgi (pola g_port_* = maski
+wszystkich portów; zmieniamy jeden bit, resztę odsyłamy tak, jak przeczytaliśmy).
+`protected_ports` wyłącza sterowanie wskazanymi portami.
 
 Użycie:
   gs1100_poe.py --config config.json            # pętla: poll -> MQTT
@@ -30,6 +33,7 @@ import base64
 import json
 import logging
 import os
+import queue
 import random
 import re
 import signal
@@ -127,6 +131,18 @@ def encrypt_field(value: str) -> str:
 # ---------------------------------------------------------------- klient HTTP
 
 
+# pola POST /port_state_set.cgi <- klucze z GET /ports_info.cgi
+PORT_FIELDS = (
+    ("g_port_state", "portState"),
+    ("g_port_speed_auto", "portSpeedAuto"),
+    ("g_port_speed_10m", "portSpeed10M"),
+    ("g_port_speed_100m", "portSpeed100M"),
+    ("g_port_speed_1000m", "portSpeed1000M"),
+    ("g_port_flwcl", "portFlctl"),
+    ("g_port_poe", "portPoE"),
+)
+
+
 class AuthError(Exception):
     """Switch odrzucił hasło (albo wymaga jego zmiany) -- nie ponawiać szybko."""
 
@@ -197,17 +213,44 @@ class GS1100:
                 log.debug("logout: %s", e)
             self.token = self.cookie = None
 
-    def get(self, path: str) -> dict:
-        """GET z jednym ponownym logowaniem, gdy sesja wygasła."""
+    def get(self, path: str, form: dict | None = None) -> dict:
+        """GET (albo POST, gdy podano form) z jednym ponownym logowaniem, gdy sesja wygasła."""
         for attempt in (0, 1):
             if not self.token:
                 self.login()
             try:
-                return self._request(path)
+                return self._request(path, form)
             except SessionExpired:
                 if attempt:
                     raise
         raise AssertionError
+
+    def set_port(self, port: int, kind: str, on: bool, nports: int = 16) -> bool:
+        """Włącz/wyłącz PoE (kind="poe") albo sam port (kind="port"). Zwraca True, gdy coś zmieniono.
+
+        Panel zapisuje wszystkie porty jednym POST-em (maski bitowe), więc czytamy bieżące
+        ustawienia, zmieniamy jeden bit i odsyłamy resztę bez zmian.
+        """
+        if not 1 <= port <= nports:
+            raise ValueError(f"port {port} poza zakresem 1-{nports}")
+        cur = self.get("/ports_info.cgi")
+        cur = cur.get("data", cur)
+        form = {}
+        for field, key in PORT_FIELDS:
+            mask = _mask(cur.get(key))
+            if mask is None:
+                raise ValueError(f"brak {key} w ports_info -- nie zapisuję")
+            form[field] = mask
+        field = {"poe": "g_port_poe", "port": "g_port_state"}[kind]
+        bit = 1 << (port - 1)
+        new = form[field] | bit if on else form[field] & ~bit
+        if new == form[field]:
+            return False
+        form[field] = new
+        r = self.get("/port_state_set.cgi", form)
+        if r.get("status_msg") != "ok":
+            raise RuntimeError(f"switch odrzucił zmianę: {r.get('status_msg')!r}")
+        return True
 
     def raw(self) -> dict:
         return {"sys_info": self.get("/sys_info.cgi"), "ports_info": self.get("/ports_info.cgi")}
@@ -234,6 +277,7 @@ def parse(raw: dict, nports: int = 16) -> dict:
     sysd = raw["sys_info"].get("data", raw["sys_info"])
     portd = raw.get("ports_info", {}).get("data", raw.get("ports_info", {}))
     poe_mask = _mask(portd.get("portPoE"))
+    state_mask = _mask(portd.get("portState"))
     ports = []
     for i, row in enumerate(sysd.get("port_status", [])[:nports]):
         row = list(row)
@@ -243,6 +287,7 @@ def parse(raw: dict, nports: int = 16) -> dict:
                 # kolumny: link, tx, rx, loop, PoE [W]
                 "poe_w": _num(row[4]) if len(row) > 4 else None,
                 "poe_enabled": None if poe_mask is None else ("ON" if poe_mask >> i & 1 else "OFF"),
+                "enabled": None if state_mask is None else ("ON" if state_mask >> i & 1 else "OFF"),
             }
         )
     # total_power = budżet zasilacza (135), left_power = zapas; pobór liczy sam switch (pełne waty)
@@ -290,7 +335,26 @@ def port_names(spec) -> dict[int, str]:
     return out
 
 
-def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: int = 16) -> dict:
+def port_set(spec) -> set[int]:
+    """Lista portów: "15, 16" albo [15, 16]."""
+    if not spec:
+        return set()
+    if isinstance(spec, (list, tuple, set)):
+        return {int(p) for p in spec}
+    return {int(p) for p in re.findall(r"\d+", str(spec))}
+
+
+def controllable(cfg: dict, control: bool, port: int, kind: str) -> bool:
+    """Czy wolno przełączać dany port. Chronione: nigdy. Sam port (nie PoE): tylko gdy
+    protected_ports jest ustawione -- inaczej jednym kliknięciem można odciąć uplink."""
+    protected = port_set(cfg.get("protected_ports"))
+    if not control or port in protected:
+        return False
+    return kind == "poe" or bool(protected)
+
+
+def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: int = 16,
+                      control: bool = False) -> dict:
     cmps: dict = {}
     names = port_names(cfg.get("port_names"))
 
@@ -320,6 +384,24 @@ def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: in
             "value_template": f"{{{{ value_json.ports[{i}].poe_enabled }}}}",
             "entity_category": "diagnostic",
         }
+        for kind, key, field, label, extra in (
+            ("poe", f"p{n:02d}_poe_switch", "poe_enabled", "zasilanie PoE", {}),
+            ("port", f"p{n:02d}_port_switch", "enabled", "port aktywny", {"enabled_by_default": False}),
+        ):
+            if controllable(cfg, control, n, kind):
+                cmps[key] = {
+                    "platform": "switch",
+                    "name": f"{port} {label}",
+                    "unique_id": f"{dev_id}_{key}",
+                    "command_topic": f"{base}/{dev_id}/port/{n}/{kind}/set",
+                    "value_template": f"{{{{ value_json.ports[{i}].{field} }}}}",
+                    "state_on": "ON",
+                    "state_off": "OFF",
+                    "entity_category": "config",
+                    **extra,
+                }
+            else:
+                cmps[key] = {"platform": "switch"}  # sama platforma = usuń encję, jeśli istniała
     device = {
         "identifiers": [dev_id],
         "name": cfg.get("name") or state.get("name") or dev_id,
@@ -347,6 +429,7 @@ def discovery_payload(dev_id: str, cfg: dict, state: dict, base: str, nports: in
 class Publisher:
     def __init__(self, mqtt_cfg: dict | None, base: str, dry: bool):
         self.base, self.client = base, None
+        self.commands: queue.Queue = queue.Queue()  # (dev_id, port, kind, on)
         if dry:
             return
         import paho.mqtt.client as mqtt  # paho-mqtt >= 2.0
@@ -355,7 +438,20 @@ class Publisher:
         if mqtt_cfg.get("username"):
             c.username_pw_set(mqtt_cfg["username"], mqtt_cfg.get("password"))
         c.will_set(f"{base}/bridge/availability", "offline", retain=True)
-        c.on_connect = lambda cl, *_: cl.publish(f"{base}/bridge/availability", "online", retain=True)
+
+        def on_connect(cl, *_):
+            cl.publish(f"{base}/bridge/availability", "online", retain=True)
+            cl.subscribe(f"{base}/+/port/+/+/set")
+
+        def on_message(_cl, _ud, msg):
+            m = re.fullmatch(re.escape(base) + r"/([^/]+)/port/(\d+)/(poe|port)/set", msg.topic)
+            payload = msg.payload.decode(errors="replace").strip().upper()
+            if m and payload in ("ON", "OFF") and not msg.retain:
+                self.commands.put((m.group(1), int(m.group(2)), m.group(3), payload == "ON"))
+            else:
+                log.warning("pomijam komendę %s %r", msg.topic, payload)
+
+        c.on_connect, c.on_message = on_connect, on_message
         c.connect(mqtt_cfg.get("host", "core-mosquitto"), int(mqtt_cfg.get("port", 1883)), keepalive=60)
         c.loop_start()
         self.client = c
@@ -380,8 +476,8 @@ class Worker:
 
     AUTH_BACKOFF = 600  # złe hasło: nie dobijamy panelu (ryzyko blokady)
 
-    def __init__(self, cfg: dict, pub: Publisher, discovery_prefix: str):
-        self.cfg, self.pub, self.prefix = cfg, pub, discovery_prefix
+    def __init__(self, cfg: dict, pub: Publisher, discovery_prefix: str, control: bool = False):
+        self.cfg, self.pub, self.prefix, self.control = cfg, pub, discovery_prefix, control
         self.sw = GS1100(cfg["host"], cfg["password"], float(cfg.get("timeout", 10)))
         self.dev_id: str | None = cfg.get("id")
         self.discovered = False
@@ -403,13 +499,26 @@ class Worker:
         if not self.discovered:
             self.pub.pub(
                 f"{self.prefix}/device/{self.dev_id}/config",
-                discovery_payload(self.dev_id, self.cfg, state, self.pub.base),
+                discovery_payload(self.dev_id, self.cfg, state, self.pub.base, control=self.control),
                 retain=True,
             )
             self.discovered = True
         self.pub.pub(f"{self.pub.base}/{self.dev_id}/state", state, retain=True)
         self.pub.pub(f"{self.pub.base}/{self.dev_id}/availability", "online", retain=True)
         return True
+
+    def command(self, port: int, kind: str, on: bool) -> None:
+        """Komenda z MQTT. Uprawnienia sprawdzamy tutaj, nie tylko w discovery."""
+        what = f"{self.cfg['host']} port {port} {kind} -> {'ON' if on else 'OFF'}"
+        if not controllable(self.cfg, self.control, port, kind):
+            log.warning("odmowa: %s (sterowanie wyłączone albo port chroniony)", what)
+        else:
+            try:
+                changed = self.sw.set_port(port, kind, on)
+                log.info("%s%s", what, "" if changed else " (bez zmian)")
+            except Exception as e:  # noqa: BLE001
+                log.error("%s nieudane: %s", what, e)
+        self.poll()  # odśwież stan w HA (także po odmowie -- przełącznik wraca na miejsce)
 
     def _offline(self) -> bool:
         if self.dev_id:
@@ -464,7 +573,8 @@ def main(argv=None) -> int:
 
     base = cfg.get("base_topic", "gs1100")
     pub = Publisher(None if args.dry_run else mqtt_config(cfg), base, args.dry_run)
-    workers = [Worker(s, pub, cfg.get("discovery_prefix", "homeassistant")) for s in cfg["switches"]]
+    control = bool(cfg.get("control"))
+    workers = [Worker(s, pub, cfg.get("discovery_prefix", "homeassistant"), control) for s in cfg["switches"]]
     interval = max(5.0, float(cfg.get("interval", 30)))
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -476,7 +586,17 @@ def main(argv=None) -> int:
             ok = all([w.poll() for w in workers])
             if args.once:
                 break
-            stop.wait(max(1.0, interval - (time.monotonic() - started)))
+            deadline = started + max(1.0, interval - (time.monotonic() - started))
+            while not stop.is_set() and time.monotonic() < deadline:
+                try:
+                    dev, port, kind, on = pub.commands.get(timeout=min(1.0, max(0.05, deadline - time.monotonic())))
+                except queue.Empty:
+                    continue
+                target = [w for w in workers if w.dev_id == dev]
+                if target:
+                    target[0].command(port, kind, on)
+                else:
+                    log.warning("komenda dla nieznanego urządzenia %s", dev)
     finally:
         for w in workers:
             w._offline()

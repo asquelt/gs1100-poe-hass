@@ -19,10 +19,19 @@ import gs1100_poe as g  # noqa: E402
 
 PASSWORD = "Abcdef123!xyz"
 # Wygenerowane oryginalnym aes-util-CNB8NLUb.js z panelu: node, `import {e} from aes-util`, e(plaintext).
-JS_VECTORS = json.loads(open(__file__.replace("test_gs1100_poe.py", "aes_vectors.json")).read())
+with open(__file__.replace("test_gs1100_poe.py", "aes_vectors.json"), encoding="utf-8") as _f:
+    JS_VECTORS = json.load(_f)
+
+
+MASKS = {"portState": 0xFFFF, "portSpeedAuto": 0xFFFF, "portSpeed10M": 0, "portSpeed100M": 0,
+         "portSpeed1000M": 0xFFFF, "portFlctl": 0xFFFF, "portPoE": 0x9}
+# atrapa nie umie odszyfrować AES-a: zna szyfrogramy wartości używanych w testach
+KNOWN = {g.encrypt_field(str(v)): v for v in (0, 0x9, 0x1, 0x8009, 0xFFFF, 0xFFFE, 0xFFFB)}
 
 
 class FakeSwitch(BaseHTTPRequestHandler):
+    masks = dict(MASKS)
+    writes = 0
     token = None
     logins = 0
     expire_next = False
@@ -51,6 +60,14 @@ class FakeSwitch(BaseHTTPRequestHandler):
             cls.logins += 1
             cls.token = f"tok{cls.logins}"
             return self._send(200, {"status_msg": "ok", "v": cls.token}, cookie=cls.token)
+        if self.path == "/port_state_set.cgi":
+            if cls.token is None or self.headers.get("token") != cls.token:
+                return self._send(401)
+            if set(form) != {f for f, _ in g.PORT_FIELDS}:
+                return self._send(200, {"status_msg": "bad fields"})
+            cls.masks = {key: KNOWN[form[field][0]] for field, key in g.PORT_FIELDS}
+            cls.writes += 1
+            return self._send(200, {"status_msg": "ok"})
         if self.path == "/logout.cgi":
             cls.token = None
             return self._send(200, {"status_msg": "ok"})
@@ -75,8 +92,8 @@ class FakeSwitch(BaseHTTPRequestHandler):
                 "total_power": "135", "left_power": "115", "max_led_power": "128",
                 "port_status": rows}})
         if self.path == "/ports_info.cgi":
-            return self._send(200, {"status_msg": "ok", "data": {"model_name": "GS1100-16EP",
-                                                                  "portState": "0xffff", "portPoE": "0x9"}})
+            return self._send(200, {"status_msg": "ok", "data": {
+                "model_name": "GS1100-16EP", **{k: hex(v) for k, v in cls.masks.items()}}})
         self._send(404)
 
 
@@ -94,6 +111,7 @@ class Tests(unittest.TestCase):
 
     def setUp(self):
         FakeSwitch.token, FakeSwitch.logins, FakeSwitch.expire_next = None, 0, False
+        FakeSwitch.masks, FakeSwitch.writes = dict(MASKS), 0
 
     def test_aes_matches_panel_js(self):
         self.assertGreaterEqual(len(JS_VECTORS), 5)
@@ -103,7 +121,7 @@ class Tests(unittest.TestCase):
     def test_poll_and_relogin(self):
         sw = g.GS1100(self.host, PASSWORD)
         st = g.parse(sw.raw())
-        self.assertEqual(st["ports"][0], {"link": "1000 Mbps", "poe_w": 7.0, "poe_enabled": "ON"})
+        self.assertEqual(st["ports"][0], {"link": "1000 Mbps", "poe_w": 7.0, "poe_enabled": "ON", "enabled": "ON"})
         self.assertEqual(st["ports"][1]["poe_enabled"], "OFF")
         self.assertEqual(st["ports"][3]["poe_enabled"], "ON")
         self.assertEqual(st["poe_used"], 20)
@@ -114,6 +132,57 @@ class Tests(unittest.TestCase):
         self.assertEqual(FakeSwitch.logins, 2)
         sw.logout()
         self.assertIsNone(FakeSwitch.token)
+
+    def test_set_port_changes_one_bit_only(self):
+        sw = g.GS1100(self.host, PASSWORD)
+        self.assertTrue(sw.set_port(16, "poe", True))
+        self.assertEqual(FakeSwitch.masks, {**MASKS, "portPoE": 0x8009})
+        self.assertFalse(sw.set_port(16, "poe", True))  # już włączone -> bez zapisu
+        self.assertTrue(sw.set_port(16, "poe", False))
+        self.assertTrue(sw.set_port(4, "poe", False))
+        self.assertEqual(FakeSwitch.masks, {**MASKS, "portPoE": 0x1})
+        self.assertTrue(sw.set_port(3, "port", False))
+        self.assertEqual(FakeSwitch.masks, {**MASKS, "portPoE": 0x1, "portState": 0xFFFB})
+        self.assertEqual(FakeSwitch.writes, 4)
+        FakeSwitch.expire_next = True  # sesja wygasa przed odczytem -> re-login i zapis
+        self.assertTrue(sw.set_port(3, "port", True))
+        with self.assertRaises(ValueError):
+            sw.set_port(17, "poe", False)
+        sw.logout()
+
+    def test_control_and_protected_ports(self):
+        pub = g.Publisher(None, "gs1100", dry=True)
+        cfg = {"host": self.host, "password": PASSWORD, "protected_ports": "1, 16"}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertLogs("gs1100", "WARNING") as logs:
+            off = g.Worker(dict(cfg), pub, "homeassistant", control=False)
+            off.command(4, "poe", False)  # sterowanie wyłączone
+            w = g.Worker(dict(cfg), pub, "homeassistant", control=True)
+            w.command(1, "poe", False)  # chroniony
+            w.command(16, "port", False)  # chroniony
+            nop = g.Worker({"host": self.host, "password": PASSWORD}, pub, "homeassistant", control=True)
+            nop.command(3, "port", False)  # port bez protected_ports -> odmowa
+            self.assertEqual(FakeSwitch.writes, 0)
+            self.assertEqual(len(logs.output), 4)
+            w.command(4, "poe", False)
+            nop.command(4, "poe", True)
+        self.assertEqual(FakeSwitch.masks["portPoE"], 0x9)
+        self.assertEqual(FakeSwitch.writes, 2)
+        for wk in (off, w, nop):
+            wk.sw.logout()
+        st = {"mac": "00:11:22:33:44:55"}
+        on = g.discovery_payload("d", cfg, st, "gs1100", control=True)["components"]
+        self.assertEqual(on["p01_poe_switch"], {"platform": "switch"})
+        self.assertEqual(on["p16_port_switch"], {"platform": "switch"})
+        self.assertEqual(on["p04_poe_switch"]["command_topic"], "gs1100/d/port/4/poe/set")
+        self.assertEqual(on["p04_poe_switch"]["value_template"], "{{ value_json.ports[3].poe_enabled }}")
+        self.assertIs(on["p04_port_switch"]["enabled_by_default"], False)
+        none = g.discovery_payload("d", cfg, st, "gs1100", control=False)["components"]
+        self.assertTrue(all(none[f"p{n:02d}_{k}_switch"] == {"platform": "switch"}
+                            for n in range(1, 17) for k in ("poe", "port")))
+        noprot = g.discovery_payload("d", {"host": "h"}, st, "gs1100", control=True)["components"]
+        self.assertIn("command_topic", noprot["p01_poe_switch"])
+        self.assertEqual(noprot["p01_port_switch"], {"platform": "switch"})
 
     def test_bad_password(self):
         with self.assertRaises(g.AuthError):
@@ -132,9 +201,9 @@ class Tests(unittest.TestCase):
         self.assertEqual(rc, 0)
         msgs = dict(line.split(" ", 1) for line in out.getvalue().splitlines())
         disc = json.loads(msgs["homeassistant/device/gs1100_001122334455/config"])
-        self.assertEqual(len(disc["components"]), 4 + 16 * 3)
+        self.assertEqual(len(disc["components"]), 4 + 16 * 5)
         self.assertEqual(disc["components"]["p04_poe_w"]["value_template"], "{{ value_json.ports[3].poe_w }}")
-        names = {k: c["name"] for k, c in disc["components"].items()}
+        names = {k: c.get("name") for k, c in disc["components"].items()}
         self.assertEqual(names["p04_poe_w"], "Port 4 – Kamera 1 PoE")
         self.assertEqual(names["p09_link"], "Port 9 – Dzwonek link")
         self.assertEqual(names["p16_poe_enabled"], "Port 16 – Uplink PoE włączone")
